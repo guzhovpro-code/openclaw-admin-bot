@@ -41,74 +41,37 @@ Telegram-бот для мониторинга и аварийного управ
 ## Установка
 
 ### Требования
-- Linux (Ubuntu 22.04+ / Debian 12+)
-- Docker с запущенным OpenClaw Gateway
+- VPS с Ubuntu 22.04+ / Debian 12+
+- Работающий контейнер OpenClaw Gateway
 - Python 3.10+
-- Пользователь с доступом к Docker
 
-### Шаг 1: Создай Telegram-бота
-1. Открой [@BotFather](https://t.me/BotFather) в Telegram
-2. Отправь `/newbot`, задай имя
-3. Скопируй токен (формат: `123456:ABC-...`)
+### Способ 1: Через Claude Code (рекомендуется)
 
-### Шаг 2: Узнай свой Telegram ID
-Отправь `/start` боту [@userinfobot](https://t.me/userinfobot) — он покажет твой числовой ID.
+Откройте Claude Code и отправьте:
 
-### Шаг 3: Установи бота на сервер
+> Установи Telegram-бота для мониторинга моего OpenClaw-сервера по инструкциям из https://github.com/guzhovpro-code/openclaw-admin-bot
+>
+> Данные сервера:
+> - IP: _(ваш IP)_
+> - Логин: deploy
+> - Пароль или SSH-ключ: _(...) _
 
-**Автоматически:**
+Claude Code проведёт через создание бота в Telegram и установку. Вам нужно будет только создать бота через @BotFather и скинуть токен.
+
+### Способ 2: Вручную
+
+**Шаг 1.** Создай Telegram-бота: открой [@BotFather](https://t.me/BotFather), отправь `/newbot`, скопируй токен.
+
+**Шаг 2.** Узнай свой Telegram ID: отправь `/start` боту [@userinfobot](https://t.me/userinfobot).
+
+**Шаг 3.** Установи на сервер:
 ```bash
 git clone https://github.com/guzhovpro-code/openclaw-admin-bot.git
 cd openclaw-admin-bot
 bash install.sh
 ```
 
-**Вручную:**
-```bash
-# Зависимости
-sudo pip3 install "python-telegram-bot[job-queue]" --break-system-packages
-
-# Файлы
-mkdir -p /home/deploy/admin-bot
-cp bot.py /home/deploy/admin-bot/
-
-# Конфиг
-cat > /home/deploy/admin-bot/.env << EOF
-ADMIN_BOT_TOKEN=токен-от-BotFather
-ALLOWED_TELEGRAM_ID=твой-telegram-id
-EOF
-chmod 600 /home/deploy/admin-bot/.env
-
-# Systemd-сервис
-sudo tee /etc/systemd/system/openclaw-admin-bot.service << 'EOF'
-[Unit]
-Description=OpenClaw Admin Telegram Bot
-After=network.target docker.service
-
-[Service]
-Type=simple
-User=deploy
-WorkingDirectory=/home/deploy/admin-bot
-EnvironmentFile=/home/deploy/admin-bot/.env
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/deploy/admin-bot/bot.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable openclaw-admin-bot
-sudo systemctl start openclaw-admin-bot
-```
-
-### Шаг 4: Проверь
-```bash
-sudo systemctl status openclaw-admin-bot
-```
-Отправь `/start` своему боту в Telegram.
+**Шаг 4.** Отправь `/start` своему боту в Telegram.
 
 ## Настройка
 
