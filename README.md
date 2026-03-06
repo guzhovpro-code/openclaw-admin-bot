@@ -1,77 +1,85 @@
 # OpenClaw Admin Bot
 
-Telegram-бот для мониторинга и аварийного управления сервером OpenClaw.
+Telegram-бот для мониторинга и аварийного управления сервером [OpenClaw](https://github.com/nicepkg/openclaw).
+
+Позволяет удалённо управлять контейнером OpenClaw Gateway, следить за состоянием сервера и получать автоматические уведомления при сбоях — прямо в Telegram.
 
 ## Возможности
 
 ### Панель управления (кнопки в Telegram)
 - **СТОП / СТАРТ / РЕСТАРТ** — управление контейнером OpenClaw Gateway
-- **Статус** — состояние всех Docker-контейнеров
+- **Статус** — состояние контейнера
 - **Здоровье** — HTTP healthcheck эндпоинта `/healthz`
 - **Логи** — последние 20 строк логов контейнера
 - **Система** — диск, RAM, нагрузка
-- **Fail2ban** — текущий статус SSH-защиты
-- **Бэкапы** — состояние резервных копий
+- **Fail2ban** — текущий статус SSH-защиты (если установлен)
 
 ### Команды
 - `/start` — открыть панель управления
 - `/report` — полный отчёт о состоянии сервера
 
-### Автоматический мониторинг (фоновые алерты)
-Бот проактивно отправляет уведомления при проблемах:
+### Автоматический мониторинг
+Бот проактивно отправляет уведомления **только при проблемах**:
 
 | Проверка | Интервал | Алерт |
 |---|---|---|
-| Контейнеры Docker | 60 сек | 🔴 при падении, 🟢 при восстановлении |
-| OpenClaw healthcheck | 120 сек | 🔴 если HTTP != 200 |
-| Fail2ban баны | 30 сек | 🛡 при новом бане IP |
-| Диск | 5 мин | 🔴 если занято >= 80% |
-| RAM / нагрузка | 5 мин | 🔴 если RAM >= 90% или load высокий |
-| Бэкап конфигов | ежедневно 07:10 UTC | ⚠️ если не выполнен |
-| Бэкап MongoDB | ежедневно 03:10 UTC | 🔴 если провалился |
+| Контейнер OpenClaw | 60 сек | 🔴 при падении, 🟢 при восстановлении |
+| Healthcheck `/healthz` | 120 сек | 🔴 если HTTP ≠ 200 |
+| Fail2ban баны | 30 сек | 🛡 при бане нового IP |
+| Диск | 5 мин | 🔴 если занято ≥ 80% |
+| RAM / нагрузка | 5 мин | 🔴 если RAM ≥ 90% или load высокий |
 
-**Антиспам:** повторный алерт одного типа не чаще чем раз в 30 минут.
+Антиспам: повторный алерт одного типа не чаще чем раз в 30 минут.
+
+## Безопасность
+
+- Бот **не открывает никаких портов** на сервере
+- Работает через long polling — делает исходящие HTTPS-запросы к Telegram API
+- Доступ ограничен одним Telegram ID (жёсткая проверка в коде)
+- Секреты хранятся в `.env` файле (не попадают в git)
 
 ## Установка
 
 ### Требования
-- Ubuntu 22.04+ / Debian 12+
-- Docker
+- Linux (Ubuntu 22.04+ / Debian 12+)
+- Docker с запущенным OpenClaw Gateway
 - Python 3.10+
-- Telegram Bot (создать через [@BotFather](https://t.me/BotFather))
-- Пользователь с sudo NOPASSWD и доступом к Docker
+- Пользователь с доступом к Docker
 
-### Быстрая установка
+### Шаг 1: Создай Telegram-бота
+1. Открой [@BotFather](https://t.me/BotFather) в Telegram
+2. Отправь `/newbot`, задай имя
+3. Скопируй токен (формат: `123456:ABC-...`)
+
+### Шаг 2: Узнай свой Telegram ID
+Отправь `/start` боту [@userinfobot](https://t.me/userinfobot) — он покажет твой числовой ID.
+
+### Шаг 3: Установи бота на сервер
+
+**Автоматически:**
 ```bash
 git clone https://github.com/guzhovpro-code/openclaw-admin-bot.git
 cd openclaw-admin-bot
 bash install.sh
 ```
 
-### Ручная установка
-
-1. Установи зависимости:
+**Вручную:**
 ```bash
+# Зависимости
 sudo pip3 install "python-telegram-bot[job-queue]" --break-system-packages
-```
 
-2. Скопируй файлы:
-```bash
+# Файлы
 mkdir -p /home/deploy/admin-bot
 cp bot.py /home/deploy/admin-bot/
-```
 
-3. Создай `.env`:
-```bash
+# Конфиг
 cat > /home/deploy/admin-bot/.env << EOF
 ADMIN_BOT_TOKEN=токен-от-BotFather
 ALLOWED_TELEGRAM_ID=твой-telegram-id
 EOF
 chmod 600 /home/deploy/admin-bot/.env
-```
 
-4. Создай systemd-сервис:
-```bash
+# Systemd-сервис
 sudo tee /etc/systemd/system/openclaw-admin-bot.service << 'EOF'
 [Unit]
 Description=OpenClaw Admin Telegram Bot
@@ -96,47 +104,30 @@ sudo systemctl enable openclaw-admin-bot
 sudo systemctl start openclaw-admin-bot
 ```
 
-5. Проверь:
+### Шаг 4: Проверь
 ```bash
 sudo systemctl status openclaw-admin-bot
 ```
+Отправь `/start` своему боту в Telegram.
 
 ## Настройка
 
-### Контейнеры для мониторинга
-В файле `bot.py` измени список `CONTAINERS`:
-```python
-CONTAINERS = [
-    "repo-openclaw-gateway-1",
-    "repo-openclaw-cli-1",
-    "root-traefik-1",
-    "root-n8n-1",
-]
-```
+Все параметры задаются в `.env` файле:
 
-### Игнорируемые контейнеры
-Контейнеры, которые должны быть остановлены (не вызывают алерт):
-```python
-EXPECTED_DOWN = {"repo-openclaw-cli-1"}
-```
+```bash
+# Обязательные
+ADMIN_BOT_TOKEN=токен
+ALLOWED_TELEGRAM_ID=числовой-id
 
-### Пороги алертов
-```python
-DISK_THRESHOLD = 80   # процент заполненности диска
-RAM_THRESHOLD = 90    # процент использования RAM
-LOAD_FACTOR = 4.0     # load > ядра * factor
-ALERT_COOLDOWN = 1800 # антиспам, секунды
+# Опциональные (значения по умолчанию)
+OPENCLAW_CONTAINER=repo-openclaw-gateway-1   # имя Docker-контейнера
+OPENCLAW_HEALTH_URL=http://127.0.0.1:18789/healthz  # URL healthcheck
+DISK_THRESHOLD=80        # порог диска (%)
+RAM_THRESHOLD=90         # порог RAM (%)
+LOAD_FACTOR=4.0          # порог нагрузки (load > ядра × factor)
+ALERT_COOLDOWN=1800      # антиспам алертов (секунды)
+FAIL2BAN_LOG=/var/log/fail2ban.log  # путь к логу fail2ban
 ```
-
-### Пути к логам
-```python
-FAIL2BAN_LOG = "/var/log/fail2ban.log"
-CONFIG_BACKUP_LOG = "/var/log/openclaw-backup.log"
-MONGO_BACKUP_LOG = "/var/log/mongo_backup.log"
-```
-
-## Как узнать свой Telegram ID
-Отправь `/start` боту [@userinfobot](https://t.me/userinfobot) — он покажет твой ID.
 
 ## Лицензия
 MIT

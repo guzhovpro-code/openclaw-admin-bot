@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenClaw Admin Bot v2 — управление контейнером и мониторинг сервера."""
+"""OpenClaw Admin Bot — управление контейнером и мониторинг сервера."""
 
 import os
 import asyncio
@@ -15,32 +15,27 @@ from telegram.ext import (
 )
 
 # ── Конфигурация ──────────────────────────────────────────────
+# Все параметры читаются из .env или используют значения по умолчанию.
 
 BOT_TOKEN = os.environ["ADMIN_BOT_TOKEN"]
 CHAT_ID = int(os.environ["ALLOWED_TELEGRAM_ID"])
 
-PRIMARY = "repo-openclaw-gateway-1"
-CONTAINERS = [
-    "repo-openclaw-gateway-1",
-    "repo-openclaw-cli-1",
-    "root-traefik-1",
-    "root-n8n-1",
-    "main-icambio-finance",
-    "usdt-icambio-finance",
-]
-EXPECTED_DOWN = {"repo-openclaw-cli-1"}
+# Имя контейнера OpenClaw Gateway (можно переопределить в .env)
+CONTAINER = os.environ.get("OPENCLAW_CONTAINER", "repo-openclaw-gateway-1")
 
-HEALTH_URL = "http://127.0.0.1:18789/healthz"
+# URL healthcheck-эндпоинта OpenClaw
+HEALTH_URL = os.environ.get("OPENCLAW_HEALTH_URL", "http://127.0.0.1:18789/healthz")
 
-DISK_THRESHOLD = 80
-RAM_THRESHOLD = 90
-LOAD_FACTOR = 4.0
+# Пороги для алертов
+DISK_THRESHOLD = int(os.environ.get("DISK_THRESHOLD", "80"))
+RAM_THRESHOLD = int(os.environ.get("RAM_THRESHOLD", "90"))
+LOAD_FACTOR = float(os.environ.get("LOAD_FACTOR", "4.0"))
 
-ALERT_COOLDOWN = 1800  # 30 мин
+# Антиспам: повторный алерт не чаще чем раз в N секунд
+ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "1800"))
 
-FAIL2BAN_LOG = "/var/log/fail2ban.log"
-CONFIG_BACKUP_LOG = "/var/log/openclaw-backup.log"
-MONGO_BACKUP_LOG = "/var/log/mongo_backup.log"
+# Путь к логу fail2ban (если fail2ban установлен)
+FAIL2BAN_LOG = os.environ.get("FAIL2BAN_LOG", "/var/log/fail2ban.log")
 
 # ── Дедупликация алертов ──────────────────────────────────────
 
@@ -71,7 +66,7 @@ dedup = AlertDedup()
 
 # ── Состояние мониторинга ─────────────────────────────────────
 
-_container_was_up: dict[str, bool] = {}
+_container_was_up: bool = True
 _health_was_ok: bool = True
 _f2b_offset: int = 0
 
@@ -116,7 +111,6 @@ def keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("Fail2ban", callback_data="f2b"),
-            InlineKeyboardButton("Бэкапы", callback_data="backups"),
         ],
     ])
 
@@ -139,26 +133,22 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Собираю отчёт...")
 
     results = await asyncio.gather(
-        sh("docker ps -a --format '{{.Names}}: {{.Status}}'"),
+        sh(f"docker ps -a --filter name={CONTAINER} --format '{{{{.Names}}}}: {{{{.Status}}}}'"),
         sh("df -h / --output=pcent,avail | tail -1"),
         sh("free -m | awk '/Mem:/{printf \"%d/%d МБ (%.0f%% занято)\", $3,$2,$3/$2*100}'"),
         sh("uptime | awk -F'load average:' '{print $2}'"),
         sh(f"curl -s -o /dev/null -w '%{{http_code}}' {HEALTH_URL}"),
-        sh("sudo fail2ban-client status sshd 2>/dev/null | grep -E 'Currently|Total'"),
-        sh(f"tail -2 {CONFIG_BACKUP_LOG} 2>/dev/null"),
-        sh(f"tail -3 {MONGO_BACKUP_LOG} 2>/dev/null"),
+        sh("sudo fail2ban-client status sshd 2>/dev/null | grep -E 'Currently|Total' || echo 'fail2ban не установлен'"),
     )
 
     text = (
         "📊 ОТЧЁТ СЕРВЕРА\n\n"
-        f"🐳 Контейнеры:\n{results[0]}\n\n"
+        f"🐳 Контейнер:\n{results[0]}\n\n"
         f"💾 Диск: {results[1].strip()}\n"
         f"🧠 RAM: {results[2]}\n"
         f"⚡ Нагрузка:{results[3]}\n\n"
         f"🏥 OpenClaw Health: HTTP {results[4]}\n\n"
-        f"🛡 Fail2ban:\n{results[5]}\n\n"
-        f"📦 Бэкап конфигов:\n{results[6]}\n\n"
-        f"📦 Бэкап MongoDB:\n{results[7]}"
+        f"🛡 Fail2ban:\n{results[5]}"
     )
     await update.message.reply_text(text[:4096])
 
@@ -178,26 +168,26 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "stop":
         await q.edit_message_text("Останавливаю...")
-        result = f"⛔ ОСТАНОВЛЕН\n{await sh(f'docker stop {PRIMARY}')}"
+        result = f"⛔ ОСТАНОВЛЕН\n{await sh(f'docker stop {CONTAINER}')}"
 
     elif action == "start":
         await q.edit_message_text("Запускаю...")
-        result = f"✅ ЗАПУЩЕН\n{await sh(f'docker start {PRIMARY}')}"
+        result = f"✅ ЗАПУЩЕН\n{await sh(f'docker start {CONTAINER}')}"
 
     elif action == "restart":
         await q.edit_message_text("Перезапускаю...")
-        result = f"🔄 ПЕРЕЗАПУЩЕН\n{await sh(f'docker restart {PRIMARY}')}"
+        result = f"🔄 ПЕРЕЗАПУЩЕН\n{await sh(f'docker restart {CONTAINER}')}"
 
     elif action == "status":
-        result = await sh("docker ps -a --format '{{.Names}}: {{.Status}}'")
+        result = await sh(f"docker ps -a --filter name={CONTAINER} --format '{{{{.Names}}}}: {{{{.Status}}}}'")
 
     elif action == "health":
-        status = await sh(f"docker ps --filter name={PRIMARY} --format '{{{{.Status}}}}'")
+        status = await sh(f"docker ps --filter name={CONTAINER} --format '{{{{.Status}}}}'")
         code = await sh(f"curl -s -o /dev/null -w '%{{http_code}}' {HEALTH_URL}")
         result = f"Контейнер: {status}\nHTTP: {code}"
 
     elif action == "logs":
-        raw = await sh(f"docker logs --tail 20 {PRIMARY}")
+        raw = await sh(f"docker logs --tail 20 {CONTAINER}")
         text = f"```\n{raw[:3900]}\n```"
         await q.edit_message_text(text, parse_mode="Markdown")
         await ctx.bot.send_message(chat_id=q.message.chat_id, text="Выбери действие:", reply_markup=keyboard())
@@ -210,12 +200,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = f"💾 Диск: {disk.strip()}\n🧠 RAM: {mem}\n⚡ {load}"
 
     elif action == "f2b":
-        result = await sh("sudo fail2ban-client status sshd 2>/dev/null")
-
-    elif action == "backups":
-        cfg = await sh(f"tail -2 {CONFIG_BACKUP_LOG} 2>/dev/null")
-        mongo = await sh(f"tail -3 {MONGO_BACKUP_LOG} 2>/dev/null")
-        result = f"📦 Конфиги:\n{cfg}\n\n📦 MongoDB:\n{mongo}"
+        result = await sh("sudo fail2ban-client status sshd 2>/dev/null || echo 'fail2ban не установлен'")
 
     await q.edit_message_text(result[:4096])
     await ctx.bot.send_message(chat_id=q.message.chat_id, text="Выбери действие:", reply_markup=keyboard())
@@ -224,31 +209,25 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Фоновый мониторинг ────────────────────────────────────────
 
 
-async def job_containers(ctx: CallbackContext):
-    output = await sh("docker ps -a --format '{{.Names}}|{{.Status}}'")
-    for line in output.strip().split("\n"):
-        if "|" not in line:
-            continue
-        name, status = line.split("|", 1)
-        name = name.strip()
-        if name not in CONTAINERS or name in EXPECTED_DOWN:
-            continue
-        is_up = status.strip().startswith("Up")
-        was_up = _container_was_up.get(name, True)
+async def job_container(ctx: CallbackContext):
+    global _container_was_up
+    output = await sh(f"docker ps --filter name={CONTAINER} --format '{{{{.Status}}}}'")
+    is_up = output.startswith("Up") if output and output != "(нет вывода)" else False
 
-        if not is_up and was_up:
-            if dedup.should_alert(f"container:{name}"):
-                await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🔴 АЛЕРТ: Контейнер {name} УПАЛ\nСтатус: {status.strip()}",
-                )
-        elif is_up and not was_up:
-            dedup.reset(f"container:{name}")
+    if not is_up and _container_was_up:
+        if dedup.should_alert("container:down"):
+            status = await sh(f"docker ps -a --filter name={CONTAINER} --format '{{{{.Status}}}}'")
             await ctx.bot.send_message(
                 chat_id=CHAT_ID,
-                text=f"🟢 ВОССТАНОВЛЕНО: Контейнер {name} снова работает",
+                text=f"🔴 АЛЕРТ: Контейнер {CONTAINER} УПАЛ\nСтатус: {status}",
             )
-        _container_was_up[name] = is_up
+    elif is_up and not _container_was_up:
+        dedup.reset("container:down")
+        await ctx.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"🟢 ВОССТАНОВЛЕНО: Контейнер {CONTAINER} снова работает",
+        )
+    _container_was_up = is_up
 
 
 async def job_health(ctx: CallbackContext):
@@ -278,11 +257,14 @@ async def job_health(ctx: CallbackContext):
 async def job_fail2ban(ctx: CallbackContext):
     global _f2b_offset
     try:
-        # Проверка ротации лога
         size_out = await sh(f"sudo wc -c < {FAIL2BAN_LOG} 2>/dev/null")
         current_size = int(size_out.strip()) if size_out.strip().isdigit() else 0
+
+        if current_size == 0:
+            return  # fail2ban не установлен или лог пуст
+
         if current_size < _f2b_offset:
-            _f2b_offset = 0
+            _f2b_offset = 0  # лог ротирован
 
         if _f2b_offset == 0:
             _f2b_offset = current_size
@@ -327,7 +309,6 @@ async def job_disk(ctx: CallbackContext):
 
 
 async def job_system(ctx: CallbackContext):
-    # RAM
     mem = await sh("free | awk '/Mem:/{printf \"%d %d\", $3, $2}'")
     try:
         used, total = map(int, mem.split())
@@ -343,7 +324,6 @@ async def job_system(ctx: CallbackContext):
     except ValueError:
         pass
 
-    # Нагрузка
     load_out = await sh("cat /proc/loadavg")
     nproc = await sh("nproc")
     try:
@@ -362,34 +342,6 @@ async def job_system(ctx: CallbackContext):
         pass
 
 
-async def job_backup_config(ctx: CallbackContext):
-    today = datetime.date.today().isoformat()
-    output = await sh(f"tail -5 {CONFIG_BACKUP_LOG} 2>/dev/null")
-    if "ERROR" in output.upper() or "error" in output:
-        if dedup.should_alert("backup:config:error"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: Бэкап конфигов — ошибки\n{output[:500]}",
-            )
-    elif today not in output:
-        if dedup.should_alert("backup:config"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"⚠️ Бэкап конфигов: нет записи за {today}\n{output[:500]}",
-            )
-
-
-async def job_backup_mongo(ctx: CallbackContext):
-    today = datetime.date.today().isoformat()
-    output = await sh(f"tail -10 {MONGO_BACKUP_LOG} 2>/dev/null")
-    if "FAILED" in output.upper() and today in output:
-        if dedup.should_alert("backup:mongo"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: Бэкап MongoDB ПРОВАЛИЛСЯ\n{output[:500]}",
-            )
-
-
 # ── Инициализация ─────────────────────────────────────────────
 
 
@@ -400,20 +352,11 @@ async def post_init(app: Application) -> None:
     ])
 
     jq = app.job_queue
-    jq.run_repeating(job_containers, interval=60, first=10)
+    jq.run_repeating(job_container, interval=60, first=10)
     jq.run_repeating(job_health, interval=120, first=15)
     jq.run_repeating(job_fail2ban, interval=30, first=5)
     jq.run_repeating(job_disk, interval=300, first=20)
     jq.run_repeating(job_system, interval=300, first=25)
-
-    jq.run_daily(
-        job_backup_config,
-        time=datetime.time(hour=7, minute=10, tzinfo=datetime.timezone.utc),
-    )
-    jq.run_daily(
-        job_backup_mongo,
-        time=datetime.time(hour=3, minute=10, tzinfo=datetime.timezone.utc),
-    )
 
     async def prune(ctx: CallbackContext):
         dedup.prune()
