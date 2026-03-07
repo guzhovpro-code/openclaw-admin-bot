@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""OpenClaw Admin Bot v2 — управление контейнером и мониторинг сервера."""
+"""OpenClaw Admin Bot v2.1 — чистый дашборд + улучшенный мониторинг."""
 
 import os
 import asyncio
 import time
 import datetime
+import calendar
 import logging
 
 import httpx
@@ -44,7 +45,18 @@ MONGO_BACKUP_LOG = "/var/log/mongo_backup.log"
 
 # OpenAI расходы
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
-COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "10.0"))  # $ в день
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "10.0"))
+COST_CHECK_INTERVAL = int(os.environ.get("COST_CHECK_INTERVAL", "300"))
+ALERT_AUTO_DELETE = int(os.environ.get("ALERT_AUTO_DELETE", "3600"))
+
+# Ступенчатые пороги расходов (% от лимита)
+COST_WARN_THRESHOLDS = [
+    (0.50, "🟡", "50%"),
+    (0.75, "🟡", "75%"),
+    (0.90, "🟠", "90%"),
+    (1.00, "🔴", "100%"),
+]
 
 # ── Дедупликация алертов ──────────────────────────────────────
 
@@ -77,7 +89,12 @@ dedup = AlertDedup()
 
 _container_was_up: dict[str, bool] = {}
 _health_was_ok: bool = True
+_openai_api_was_ok: bool = True
 _f2b_offset: int = 0
+
+# Очистка чата — отслеживание сообщений
+_prev_data_msg_id: int | None = None
+_prev_kb_msg_id: int | None = None
 
 # ── Утилиты ───────────────────────────────────────────────────
 
@@ -103,38 +120,213 @@ async def sh(cmd: str, timeout: int = 30) -> str:
         return f"ОШИБКА: {e}"
 
 
+async def _delete_msg(bot, msg_id: int):
+    """Безопасное удаление сообщения (игнорирует ошибки)."""
+    try:
+        await bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
+    except Exception:
+        pass
+
+
+async def _delete_msg_job(ctx: CallbackContext):
+    """Удаление сообщения по расписанию."""
+    await _delete_msg(ctx.bot, ctx.job.data)
+
+
+async def send_alert(ctx: CallbackContext, text: str,
+                     delete_after: int | None = None):
+    """Отправить алерт и запланировать автоудаление."""
+    if delete_after is None:
+        delete_after = ALERT_AUTO_DELETE
+    msg = await ctx.bot.send_message(chat_id=CHAT_ID, text=text)
+    if delete_after > 0:
+        ctx.job_queue.run_once(
+            _delete_msg_job, when=delete_after, data=msg.message_id,
+        )
+
+
+# ── Клавиатура ────────────────────────────────────────────────
+
+
 def keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [
-            InlineKeyboardButton("СТОП", callback_data="stop"),
-            InlineKeyboardButton("СТАРТ", callback_data="start"),
-            InlineKeyboardButton("РЕСТАРТ", callback_data="restart"),
-        ],
-        [
-            InlineKeyboardButton("Статус", callback_data="status"),
-            InlineKeyboardButton("Здоровье", callback_data="health"),
-        ],
-        [
-            InlineKeyboardButton("Логи (20)", callback_data="logs"),
-            InlineKeyboardButton("Система", callback_data="system"),
-        ],
-        [
-            InlineKeyboardButton("Fail2ban", callback_data="f2b"),
-            InlineKeyboardButton("Бэкапы", callback_data="backups"),
-        ],
-        [
+            InlineKeyboardButton("📊 Дашборд", callback_data="dashboard"),
             InlineKeyboardButton("💰 Расходы", callback_data="costs"),
         ],
-    ])
+        [
+            InlineKeyboardButton("🔄 Перезапуск", callback_data="restart_ask"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
-# ── OpenAI Usage ──────────────────────────────────────────────
-
+# ── Форматирование дашборда ───────────────────────────────────
 
 _MONTHS_RU = {
     1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
     7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек",
 }
+
+
+def _fmt_uptime(started_at: str) -> str:
+    """ISO-дату старта → '3д 14ч 22мин'."""
+    try:
+        start = datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        delta = datetime.datetime.now(datetime.timezone.utc) - start
+        total_sec = int(delta.total_seconds())
+        if total_sec < 60:
+            return f"{total_sec} сек"
+        days = total_sec // 86400
+        hours = (total_sec % 86400) // 3600
+        mins = (total_sec % 3600) // 60
+        parts = []
+        if days:
+            parts.append(f"{days}д")
+        if hours:
+            parts.append(f"{hours}ч")
+        parts.append(f"{mins}мин")
+        return " ".join(parts)
+    except Exception:
+        return "?"
+
+
+async def _fmt_disk() -> str:
+    """'42% занято (12 ГБ свободно)'."""
+    raw = await sh("df / --output=pcent,avail | tail -1")
+    try:
+        parts = raw.split()
+        pct = parts[0].rstrip("%")
+        avail_kb = int(parts[1])
+        if avail_kb >= 1_048_576:
+            avail = f"{avail_kb / 1_048_576:.1f} ГБ"
+        else:
+            avail = f"{avail_kb // 1024} МБ"
+        return f"{pct}% занято ({avail} свободно)"
+    except Exception:
+        return raw.strip()
+
+
+async def _fmt_ram() -> str:
+    """'67% (2.1 / 3.2 ГБ)'."""
+    raw = await sh("free -m | awk '/Mem:/{print $2, $3}'")
+    try:
+        total_mb, used_mb = map(int, raw.split())
+        pct = int(used_mb / total_mb * 100)
+        return f"{pct}% ({used_mb / 1024:.1f} / {total_mb / 1024:.1f} ГБ)"
+    except Exception:
+        return raw.strip()
+
+
+async def _fmt_f2b() -> str:
+    """'3 IP забанено' или 'не активен'."""
+    raw = await sh("sudo fail2ban-client status sshd 2>/dev/null")
+    try:
+        for line in raw.split("\n"):
+            if "Currently banned" in line:
+                n = int(line.split(":")[-1].strip())
+                if n == 0:
+                    return "нет банов"
+                ip_word = "IP" if n == 1 else "IP"
+                return f"{n} {ip_word} забанено"
+        return "не активен"
+    except Exception:
+        return "?"
+
+
+async def _fmt_backup(log_path: str, label: str) -> str:
+    """'✅ сегодня 07:10' или '❌ нет записи за сегодня'."""
+    today = datetime.date.today().isoformat()
+    raw = await sh(f"tail -5 {log_path} 2>/dev/null")
+    if "ОШИБКА" in raw or not raw.strip() or raw == "(нет вывода)":
+        return f"⚠️ лог недоступен"
+    if "ERROR" in raw.upper() or "FAILED" in raw.upper():
+        return f"❌ ошибка в логе"
+    if today in raw:
+        # Попробуем найти время
+        for line in reversed(raw.split("\n")):
+            if today in line:
+                try:
+                    time_part = line.split("T")[1][:5] if "T" in line else line.split()[1][:5]
+                    return f"✅ сегодня {time_part}"
+                except Exception:
+                    return f"✅ сегодня"
+        return f"✅ сегодня"
+    return f"❌ нет записи за сегодня"
+
+
+async def _check_openai_api() -> bool:
+    """Проверить доступность OpenAI API."""
+    if OPENAI_API_KEY:
+        # Project key → /v1/models
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    params={"limit": 1},
+                )
+                return resp.status_code == 200
+        except Exception:
+            return False
+    elif OPENAI_ADMIN_KEY:
+        # Admin key → /v1/organization/costs (быстрая проверка)
+        _, ok = await get_today_cost()
+        return ok
+    return True  # Нечего проверять
+
+
+async def build_dashboard() -> str:
+    """Собрать красивый дашборд."""
+    # Собираем данные параллельно
+    container_status, started_at, today_cost_result, \
+        disk, ram, f2b, backup_cfg, backup_mongo = await asyncio.gather(
+        sh(f"docker ps --filter name={PRIMARY} --format '{{{{.Status}}}}'"),
+        sh(f"docker inspect --format '{{{{.State.StartedAt}}}}' {PRIMARY} 2>/dev/null"),
+        get_today_cost(),
+        _fmt_disk(),
+        _fmt_ram(),
+        _fmt_f2b(),
+        _fmt_backup(CONFIG_BACKUP_LOG, "конфиги"),
+        _fmt_backup(MONGO_BACKUP_LOG, "MongoDB"),
+    )
+
+    today_cost, api_ok = today_cost_result
+    is_up = container_status.strip().startswith("Up")
+
+    lines = ["📊 ДАШБОРД", "━━━━━━━━━━━━━━━━━"]
+
+    # OpenClaw статус
+    if is_up:
+        uptime = _fmt_uptime(started_at.strip())
+        lines.append(f"🤖 OpenClaw: ✅ работает")
+        lines.append(f"   ⏱ аптайм: {uptime}")
+    else:
+        lines.append(f"🤖 OpenClaw: ❌ не работает")
+
+    lines.append("")
+
+    # API OpenAI
+    if OPENAI_ADMIN_KEY or OPENAI_API_KEY:
+        api_emoji = "✅ доступен" if api_ok else "❌ недоступен"
+        lines.append(f"🌐 API OpenAI: {api_emoji}")
+        remaining = max(0, COST_DAILY_LIMIT - today_cost)
+        lines.append(f"💰 Расходы: ${today_cost:.2f} из ${COST_DAILY_LIMIT:.0f} (осталось ${remaining:.2f})")
+        lines.append("")
+
+    # Ресурсы
+    lines.append(f"💾 Диск: {disk}")
+    lines.append(f"🧠 Память: {ram}")
+    lines.append(f"🛡 Fail2ban: {f2b}")
+
+    # Бэкапы
+    lines.append(f"📦 Бэкап конфигов: {backup_cfg}")
+    lines.append(f"📦 Бэкап MongoDB: {backup_mongo}")
+
+    return "\n".join(lines)
+
+
+# ── OpenAI Usage ──────────────────────────────────────────────
 
 
 def _pretty_model(name: str) -> str:
@@ -171,16 +363,15 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-async def fetch_openai_costs(days: int = 1) -> str:
+async def fetch_openai_costs(days: int = 2) -> str:
     """Получить расходы OpenAI за последние N дней — понятным языком."""
     if not OPENAI_ADMIN_KEY:
         return "⚠️ OPENAI_ADMIN_KEY не задан в .env"
 
-    import calendar
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     start = now - datetime.timedelta(days=days)
-    start_ts = int(calendar.timegm(start.timetuple()))
-    end_ts = int(calendar.timegm(now.timetuple()))
+    start_ts = int(start.timestamp())
+    end_ts = int(now.timestamp())
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -212,8 +403,7 @@ async def fetch_openai_costs(days: int = 1) -> str:
         usage_data = usage_resp.json()
 
         # ── Собираем расходы по дням, группируя по модели ──
-        # line_item: "gpt-5.4-2026-03-05, input" → модель "gpt-5.4-2026-03-05"
-        day_costs: dict[str, dict[str, float]] = {}  # day → {model → $}
+        day_costs: dict[str, dict[str, float]] = {}
         day_totals: dict[str, float] = {}
 
         for bucket in costs_data.get("data", []):
@@ -224,14 +414,13 @@ async def fetch_openai_costs(days: int = 1) -> str:
             for r in bucket.get("results", []):
                 amount = float(r.get("amount", {}).get("value", 0))
                 raw_item = r.get("line_item", "?")
-                # Извлекаем имя модели из line_item
                 model_key = raw_item.split(",")[0].strip() if "," in raw_item else raw_item
                 model_name = _pretty_model(model_key)
                 day_costs[day][model_name] = day_costs[day].get(model_name, 0) + amount
                 day_totals[day] += amount
 
-        # ── Собираем данные о токенах по дням и моделям ──
-        day_usage: dict[str, dict[str, dict]] = {}  # day → {model → {reqs, inp, cached, out}}
+        # ── Собираем данные о токенах ──
+        day_usage: dict[str, dict[str, dict]] = {}
 
         for bucket in usage_data.get("data", []):
             day = bucket.get("start_time_iso", "?")[:10]
@@ -260,7 +449,6 @@ async def fetch_openai_costs(days: int = 1) -> str:
             total_all += dt
             lines.append(f"📅 {_pretty_date(day)} — ${dt:.2f}")
 
-            # Модели по убыванию расхода
             sorted_models = sorted(day_costs[day].items(), key=lambda x: -x[1])
             for i, (model, cost) in enumerate(sorted_models):
                 if cost < 0.005:
@@ -269,7 +457,6 @@ async def fetch_openai_costs(days: int = 1) -> str:
                 prefix = "└" if is_last else "├"
                 lines.append(f"  {prefix} {model}: ${cost:.2f}")
 
-                # Добавляем детали из usage (запросы, токены)
                 usage = day_usage.get(day, {}).get(model, {})
                 reqs = usage.get("reqs", 0)
                 inp = usage.get("inp", 0)
@@ -286,25 +473,36 @@ async def fetch_openai_costs(days: int = 1) -> str:
 
             lines.append("")
 
-        # Итог
+        # Итог + бюджет
         lines.append(f"💵 Итого: ${total_all:.2f}")
         lines.append(f"📊 Лимит: ${COST_DAILY_LIMIT:.0f}/день")
-        if total_all >= COST_DAILY_LIMIT * days:
-            lines.append(f"🔴 Расходы выше лимита!")
+
+        # Остаток на сегодня
+        today_str = now.strftime("%Y-%m-%d")
+        today_cost = day_totals.get(today_str, 0.0)
+        remaining = max(0, COST_DAILY_LIMIT - today_cost)
+        lines.append(f"💳 Остаток на сегодня: ~${remaining:.2f} из ${COST_DAILY_LIMIT:.0f}")
+
+        # Средний расход
+        n_days = max(len(day_totals), 1)
+        avg_daily = total_all / n_days
+        lines.append(f"📈 Средний расход: ~${avg_daily:.2f}/день")
+
+        if today_cost >= COST_DAILY_LIMIT:
+            lines.append(f"🔴 Дневной лимит превышен!")
 
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
 
-async def get_today_cost() -> float:
-    """Получить стоимость за текущий день."""
+async def get_today_cost() -> tuple[float, bool]:
+    """Получить стоимость за текущий день. Возвращает (сумма, api_ok)."""
     if not OPENAI_ADMIN_KEY:
-        return 0.0
-    import calendar
-    now = datetime.datetime.utcnow()
-    start = now.replace(hour=0, minute=0, second=0)
-    start_ts = int(calendar.timegm(start.timetuple()))
+        return 0.0, True
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(start.timestamp())
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -313,29 +511,32 @@ async def get_today_cost() -> float:
                 headers={"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"},
             )
         if resp.status_code != 200:
-            return 0.0
+            return 0.0, False
         total = 0.0
         for bucket in resp.json().get("data", []):
             for r in bucket.get("results", []):
                 total += float(r.get("amount", {}).get("value", 0))
-        return total
+        return total, True
     except Exception:
-        return 0.0
+        return 0.0, False
 
 
 # ── Команды ───────────────────────────────────────────────────
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _prev_kb_msg_id
     if not authorized(update):
         return
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "Панель управления OpenClaw\nВыбери действие:",
         reply_markup=keyboard(),
     )
+    _prev_kb_msg_id = msg.message_id
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Полный технический отчёт (для администратора, не для скриншотов)."""
     if not authorized(update):
         return
     await update.message.reply_text("Собираю отчёт...")
@@ -369,6 +570,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _prev_data_msg_id, _prev_kb_msg_id
     q = update.callback_query
     if q.from_user.id != CHAT_ID:
         await q.answer("Нет доступа")
@@ -378,53 +580,58 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = q.data
     result = ""
 
-    if action == "stop":
-        await q.edit_message_text("Останавливаю...")
-        result = f"⛔ ОСТАНОВЛЕН\n{await sh(f'docker stop {PRIMARY}')}"
-
-    elif action == "start":
-        await q.edit_message_text("Запускаю...")
-        result = f"✅ ЗАПУЩЕН\n{await sh(f'docker start {PRIMARY}')}"
-
-    elif action == "restart":
-        await q.edit_message_text("Перезапускаю...")
-        result = f"🔄 ПЕРЕЗАПУЩЕН\n{await sh(f'docker restart {PRIMARY}')}"
-
-    elif action == "status":
-        result = await sh("docker ps -a --format '{{.Names}}: {{.Status}}'")
-
-    elif action == "health":
-        status = await sh(f"docker ps --filter name={PRIMARY} --format '{{{{.Status}}}}'")
-        code = await sh(f"curl -s -o /dev/null -w '%{{http_code}}' {HEALTH_URL}")
-        result = f"Контейнер: {status}\nHTTP: {code}"
-
-    elif action == "logs":
-        raw = await sh(f"docker logs --tail 20 {PRIMARY}")
-        text = f"```\n{raw[:3900]}\n```"
-        await q.edit_message_text(text, parse_mode="Markdown")
-        await ctx.bot.send_message(chat_id=q.message.chat_id, text="Выбери действие:", reply_markup=keyboard())
+    # ── Перезапуск с подтверждением ──
+    if action == "restart_ask":
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, перезапустить", callback_data="restart_yes"),
+                InlineKeyboardButton("❌ Отмена", callback_data="restart_no"),
+            ]
+        ])
+        await q.edit_message_text("Перезапустить OpenClaw?", reply_markup=confirm_kb)
         return
 
-    elif action == "system":
-        disk = await sh("df -h / --output=pcent,size,avail | tail -1")
-        mem = await sh("free -m | awk '/Mem:/{printf \"%d/%d МБ занято\", $3,$2}'")
-        load = await sh("uptime")
-        result = f"💾 Диск: {disk.strip()}\n🧠 RAM: {mem}\n⚡ {load}"
+    if action == "restart_yes":
+        await q.edit_message_text("🔄 Перезапускаю OpenClaw...")
+        output = await sh(f"docker restart {PRIMARY}")
+        result = f"🔄 ПЕРЕЗАПУЩЕН\n{output}"
 
-    elif action == "f2b":
-        result = await sh("sudo fail2ban-client status sshd 2>/dev/null")
+    elif action == "restart_no":
+        await q.edit_message_text("Отменено.")
+        # Удалить сообщение отмены и показать меню
+        if _prev_data_msg_id:
+            await _delete_msg(ctx.bot, _prev_data_msg_id)
+        _prev_data_msg_id = q.message.message_id
+        kb_msg = await ctx.bot.send_message(
+            chat_id=CHAT_ID, text="Выбери действие:", reply_markup=keyboard(),
+        )
+        _prev_kb_msg_id = kb_msg.message_id
+        return
 
-    elif action == "backups":
-        cfg = await sh(f"tail -2 {CONFIG_BACKUP_LOG} 2>/dev/null")
-        mongo = await sh(f"tail -3 {MONGO_BACKUP_LOG} 2>/dev/null")
-        result = f"📦 Конфиги:\n{cfg}\n\n📦 MongoDB:\n{mongo}"
+    elif action == "dashboard":
+        await q.edit_message_text("📊 Загружаю дашборд...")
+        result = await build_dashboard()
 
     elif action == "costs":
         await q.edit_message_text("💰 Загружаю расходы...")
         result = await fetch_openai_costs(days=2)
 
+    else:
+        result = "Неизвестная команда"
+
+    # ── Очистка чата: удалить предыдущий ответ ──
+    if _prev_data_msg_id:
+        await _delete_msg(ctx.bot, _prev_data_msg_id)
+
+    # Текущее сообщение (от кнопки) обновляем данными
     await q.edit_message_text(result[:4096])
-    await ctx.bot.send_message(chat_id=q.message.chat_id, text="Выбери действие:", reply_markup=keyboard())
+    _prev_data_msg_id = q.message.message_id
+
+    # Новое сообщение с клавиатурой
+    kb_msg = await ctx.bot.send_message(
+        chat_id=CHAT_ID, text="Выбери действие:", reply_markup=keyboard(),
+    )
+    _prev_kb_msg_id = kb_msg.message_id
 
 
 # ── Фоновый мониторинг ────────────────────────────────────────
@@ -444,15 +651,17 @@ async def job_containers(ctx: CallbackContext):
 
         if not is_up and was_up:
             if dedup.should_alert(f"container:{name}"):
-                await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🔴 АЛЕРТ: Контейнер {name} УПАЛ\nСтатус: {status.strip()}",
+                await send_alert(
+                    ctx,
+                    f"🔴 Контейнер {name} УПАЛ\nСтатус: {status.strip()}",
+                    delete_after=7200,  # 2 часа — критический алерт
                 )
         elif is_up and not was_up:
             dedup.reset(f"container:{name}")
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🟢 ВОССТАНОВЛЕНО: Контейнер {name} снова работает",
+            await send_alert(
+                ctx,
+                f"🟢 Контейнер {name} снова работает",
+                delete_after=1800,  # 30 мин — восстановление
             )
         _container_was_up[name] = is_up
 
@@ -468,15 +677,17 @@ async def job_health(ctx: CallbackContext):
 
     if not ok and _health_was_ok:
         if dedup.should_alert("health:openclaw"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: OpenClaw healthcheck НЕ ОТВЕЧАЕТ\n{HEALTH_URL}",
+            await send_alert(
+                ctx,
+                f"🔴 OpenClaw healthcheck НЕ ОТВЕЧАЕТ",
+                delete_after=7200,
             )
     elif ok and not _health_was_ok:
         dedup.reset("health:openclaw")
-        await ctx.bot.send_message(
-            chat_id=CHAT_ID,
-            text="🟢 ВОССТАНОВЛЕНО: OpenClaw healthcheck OK",
+        await send_alert(
+            ctx,
+            "🟢 OpenClaw healthcheck восстановлен",
+            delete_after=1800,
         )
     _health_was_ok = ok
 
@@ -484,7 +695,6 @@ async def job_health(ctx: CallbackContext):
 async def job_fail2ban(ctx: CallbackContext):
     global _f2b_offset
     try:
-        # Проверка ротации лога
         size_out = await sh(f"sudo wc -c < {FAIL2BAN_LOG} 2>/dev/null")
         current_size = int(size_out.strip()) if size_out.strip().isdigit() else 0
         if current_size < _f2b_offset:
@@ -507,10 +717,7 @@ async def job_fail2ban(ctx: CallbackContext):
                 parts = line.strip().split()
                 ip = parts[-1] if parts else "?"
                 if dedup.should_alert(f"f2b:{ip}"):
-                    await ctx.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=f"🛡 FAIL2BAN: Забанен {ip}\n{line.strip()[:200]}",
-                    )
+                    await send_alert(ctx, f"🛡 Fail2ban: забанен {ip}")
     except Exception as e:
         logging.warning(f"fail2ban check: {e}")
 
@@ -524,9 +731,10 @@ async def job_disk(ctx: CallbackContext):
     if pct >= DISK_THRESHOLD:
         if dedup.should_alert("disk:/"):
             avail = await sh("df -h / --output=avail | tail -1")
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: Диск заполнен на {pct}%\nСвободно: {avail.strip()}",
+            await send_alert(
+                ctx,
+                f"🔴 Диск заполнен на {pct}%\nСвободно: {avail.strip()}",
+                delete_after=7200,
             )
     else:
         dedup.reset("disk:/")
@@ -540,9 +748,9 @@ async def job_system(ctx: CallbackContext):
         pct = int(used / total * 100)
         if pct >= RAM_THRESHOLD:
             if dedup.should_alert("ram:high"):
-                await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🔴 АЛЕРТ: RAM {pct}% ({used // 1024} / {total // 1024} МБ)",
+                await send_alert(
+                    ctx,
+                    f"🔴 RAM: {pct}% ({used // 1024} / {total // 1024} МБ)",
                 )
         else:
             dedup.reset("ram:high")
@@ -558,9 +766,9 @@ async def job_system(ctx: CallbackContext):
         thresh = cores * LOAD_FACTOR
         if load5 > thresh:
             if dedup.should_alert("load:high"):
-                await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🔴 АЛЕРТ: Нагрузка {load5} (порог: {thresh}, ядер: {cores})",
+                await send_alert(
+                    ctx,
+                    f"🔴 Нагрузка: {load5:.1f} (порог: {thresh:.0f})",
                 )
         else:
             dedup.reset("load:high")
@@ -573,16 +781,10 @@ async def job_backup_config(ctx: CallbackContext):
     output = await sh(f"tail -5 {CONFIG_BACKUP_LOG} 2>/dev/null")
     if "ERROR" in output.upper() or "error" in output:
         if dedup.should_alert("backup:config:error"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: Бэкап конфигов — ошибки\n{output[:500]}",
-            )
+            await send_alert(ctx, f"🔴 Бэкап конфигов: ошибка в логе")
     elif today not in output:
         if dedup.should_alert("backup:config"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"⚠️ Бэкап конфигов: нет записи за {today}\n{output[:500]}",
-            )
+            await send_alert(ctx, f"⚠️ Бэкап конфигов: нет записи за сегодня")
 
 
 async def job_backup_mongo(ctx: CallbackContext):
@@ -590,29 +792,50 @@ async def job_backup_mongo(ctx: CallbackContext):
     output = await sh(f"tail -10 {MONGO_BACKUP_LOG} 2>/dev/null")
     if "FAILED" in output.upper() and today in output:
         if dedup.should_alert("backup:mongo"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔴 АЛЕРТ: Бэкап MongoDB ПРОВАЛИЛСЯ\n{output[:500]}",
-            )
+            await send_alert(ctx, f"🔴 Бэкап MongoDB: ПРОВАЛИЛСЯ")
 
 
 async def job_cost_alert(ctx: CallbackContext):
-    """Проверка дневных расходов OpenAI."""
+    """Проверка расходов OpenAI — ступенчатые пороги + детекция API."""
+    global _openai_api_was_ok
     if not OPENAI_ADMIN_KEY:
         return
-    cost = await get_today_cost()
-    if cost >= COST_DAILY_LIMIT:
-        if dedup.should_alert("cost:daily"):
-            await ctx.bot.send_message(
-                chat_id=CHAT_ID,
-                text=(
-                    f"🔴 РАСХОДЫ: ${cost:.2f} сегодня"
-                    f" (лимит: ${COST_DAILY_LIMIT:.0f})\n"
-                    f"Проверь кнопкой 💰 Расходы"
-                ),
+
+    cost, api_ok = await get_today_cost()
+
+    # ── Детекция состояния API ──
+    if not api_ok and _openai_api_was_ok:
+        if dedup.should_alert("openai:api_down"):
+            await send_alert(
+                ctx,
+                "🔴 OpenAI API недоступен — квота исчерпана или ошибка",
+                delete_after=7200,
             )
-    else:
-        dedup.reset("cost:daily")
+    elif api_ok and not _openai_api_was_ok:
+        dedup.reset("openai:api_down")
+        # Сбрасываем все пороги расходов при восстановлении
+        for pct, _, _ in COST_WARN_THRESHOLDS:
+            dedup.reset(f"cost:daily:{int(pct * 100)}")
+        await send_alert(
+            ctx,
+            "🟢 OpenAI API восстановлен — баланс пополнен",
+            delete_after=3600,
+        )
+    _openai_api_was_ok = api_ok
+
+    # ── Ступенчатые пороги расходов ──
+    if api_ok:
+        for pct, emoji, label in COST_WARN_THRESHOLDS:
+            threshold = COST_DAILY_LIMIT * pct
+            key = f"cost:daily:{int(pct * 100)}"
+            if cost >= threshold:
+                if dedup.should_alert(key):
+                    await send_alert(
+                        ctx,
+                        f"{emoji} Расходы: ${cost:.2f} — {label} лимита (${COST_DAILY_LIMIT:.0f}/день)",
+                    )
+            else:
+                dedup.reset(key)
 
 
 # ── Инициализация ─────────────────────────────────────────────
@@ -621,7 +844,7 @@ async def job_cost_alert(ctx: CallbackContext):
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         ("start", "Панель управления"),
-        ("report", "Полный отчёт"),
+        ("report", "Полный техотчёт"),
     ])
 
     jq = app.job_queue
@@ -631,10 +854,13 @@ async def post_init(app: Application) -> None:
     jq.run_repeating(job_disk, interval=300, first=20)
     jq.run_repeating(job_system, interval=300, first=25)
 
-    # Расходы OpenAI — каждые 30 мин
+    # Расходы OpenAI — каждые 5 мин (по умолчанию)
     if OPENAI_ADMIN_KEY:
-        jq.run_repeating(job_cost_alert, interval=1800, first=60)
-        logging.info(f"Мониторинг расходов OpenAI: лимит ${COST_DAILY_LIMIT}/день")
+        jq.run_repeating(job_cost_alert, interval=COST_CHECK_INTERVAL, first=60)
+        logging.info(
+            f"Мониторинг расходов: каждые {COST_CHECK_INTERVAL}с, "
+            f"лимит ${COST_DAILY_LIMIT}/день"
+        )
 
     jq.run_daily(
         job_backup_config,
@@ -649,7 +875,7 @@ async def post_init(app: Application) -> None:
         dedup.prune()
     jq.run_repeating(prune, interval=3600, first=3600)
 
-    logging.info("Бот запущен, мониторинг активен")
+    logging.info("Бот v2.1 запущен, мониторинг активен")
 
 
 # ── Точка входа ───────────────────────────────────────────────
