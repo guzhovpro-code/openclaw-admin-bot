@@ -37,6 +37,10 @@ ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "1800"))
 # Путь к логу fail2ban (если fail2ban установлен)
 FAIL2BAN_LOG = os.environ.get("FAIL2BAN_LOG", "/var/log/fail2ban.log")
 
+# Расходы OpenAI (опционально — кнопка появится только при наличии ключа)
+OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
+COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "10.0"))
+
 # ── Дедупликация алертов ──────────────────────────────────────
 
 
@@ -95,7 +99,7 @@ async def sh(cmd: str, timeout: int = 30) -> str:
 
 
 def keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("СТОП", callback_data="stop"),
             InlineKeyboardButton("СТАРТ", callback_data="start"),
@@ -112,7 +116,205 @@ def keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Fail2ban", callback_data="f2b"),
         ],
-    ])
+    ]
+    if OPENAI_ADMIN_KEY:
+        rows.append([InlineKeyboardButton("💰 Расходы", callback_data="costs")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── Расходы OpenAI (понятный русский) ────────────────────────
+
+_MONTHS_RU = {
+    1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
+    7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек",
+}
+
+
+def _pretty_model(name: str) -> str:
+    """gpt-5.4-2026-03-05 → GPT-5.4"""
+    n = name.lower()
+    if "gpt-5.4" in n:
+        return "GPT-5.4"
+    if "gpt-5.2" in n:
+        return "GPT-5.2"
+    if "gpt-4.1" in n and "mini" in n:
+        return "GPT-4.1 Mini"
+    if "gpt-4.1" in n:
+        return "GPT-4.1"
+    if "gpt-4o" in n and "mini" in n and "transcribe" in n:
+        return "Транскрипция (мини)"
+    if "transcribe" in n:
+        return "Транскрипция"
+    if "whisper" in n:
+        return "Распознавание речи"
+    # Убираем суффикс с датой
+    short = name.split("-2026")[0].split("-2025")[0].split("-2024")[0]
+    return short.upper() if len(short) < 20 else name
+
+
+def _pretty_date(iso: str) -> str:
+    """2026-03-06 → 6 мар"""
+    try:
+        d = datetime.date.fromisoformat(iso[:10])
+        return f"{d.day} {_MONTHS_RU.get(d.month, '?')}"
+    except Exception:
+        return iso[:10]
+
+
+def _fmt_tokens(n: int) -> str:
+    """7430012 → 7.4 млн, 23795 → 24 тыс, 500 → 500"""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} млн"
+    if n >= 1_000:
+        return f"{n // 1_000} тыс"
+    return str(n)
+
+
+async def fetch_openai_costs(days: int = 2) -> str:
+    """Получить расходы OpenAI за последние N дней — понятным языком."""
+    if not OPENAI_ADMIN_KEY:
+        return "⚠️ OPENAI_ADMIN_KEY не задан в .env"
+
+    import calendar
+    now = datetime.datetime.utcnow()
+    start = now - datetime.timedelta(days=days)
+    start_ts = int(calendar.timegm(start.timetuple()))
+    end_ts = int(calendar.timegm(now.timetuple()))
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            costs_resp = await client.get(
+                "https://api.openai.com/v1/organization/costs",
+                params={
+                    "start_time": start_ts,
+                    "end_time": end_ts,
+                    "bucket_width": "1d",
+                    "group_by[]": "line_item",
+                },
+                headers={"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"},
+            )
+            usage_resp = await client.get(
+                "https://api.openai.com/v1/organization/usage/completions",
+                params={
+                    "start_time": start_ts,
+                    "end_time": end_ts,
+                    "bucket_width": "1d",
+                    "group_by[]": "model",
+                },
+                headers={"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"},
+            )
+
+        if costs_resp.status_code != 200:
+            return f"❌ Ошибка API: {costs_resp.status_code}\n{costs_resp.text[:200]}"
+
+        costs_data = costs_resp.json()
+        usage_data = usage_resp.json()
+
+        # ── Расходы по дням, группируя по модели ──
+        day_costs: dict[str, dict[str, float]] = {}
+        day_totals: dict[str, float] = {}
+
+        for bucket in costs_data.get("data", []):
+            day = bucket.get("start_time_iso", "?")[:10]
+            if day not in day_costs:
+                day_costs[day] = {}
+                day_totals[day] = 0.0
+            for r in bucket.get("results", []):
+                amount = float(r.get("amount", {}).get("value", 0))
+                raw_item = r.get("line_item", "?")
+                model_key = raw_item.split(",")[0].strip() if "," in raw_item else raw_item
+                model_name = _pretty_model(model_key)
+                day_costs[day][model_name] = day_costs[day].get(model_name, 0) + amount
+                day_totals[day] += amount
+
+        # ── Токены по дням и моделям ──
+        day_usage: dict[str, dict[str, dict]] = {}
+
+        for bucket in usage_data.get("data", []):
+            day = bucket.get("start_time_iso", "?")[:10]
+            if day not in day_usage:
+                day_usage[day] = {}
+            for r in bucket.get("results", []):
+                model_name = _pretty_model(r.get("model", "?"))
+                inp = r.get("input_tokens", 0)
+                cached = r.get("input_cached_tokens", 0)
+                out = r.get("output_tokens", 0)
+                reqs = r.get("num_model_requests", 0)
+                if model_name not in day_usage[day]:
+                    day_usage[day][model_name] = {"reqs": 0, "inp": 0, "cached": 0, "out": 0}
+                d = day_usage[day][model_name]
+                d["reqs"] += reqs
+                d["inp"] += inp
+                d["cached"] += cached
+                d["out"] += out
+
+        # ── Формируем вывод ──
+        lines = ["💰 РАСХОДЫ НА ИИ", ""]
+        total_all = 0.0
+
+        for day in sorted(day_costs.keys()):
+            dt = day_totals.get(day, 0)
+            total_all += dt
+            lines.append(f"📅 {_pretty_date(day)} — ${dt:.2f}")
+
+            sorted_models = sorted(day_costs[day].items(), key=lambda x: -x[1])
+            for i, (model, cost) in enumerate(sorted_models):
+                if cost < 0.005:
+                    continue
+                is_last = (i == len(sorted_models) - 1)
+                prefix = "└" if is_last else "├"
+                lines.append(f"  {prefix} {model}: ${cost:.2f}")
+
+                usage = day_usage.get(day, {}).get(model, {})
+                reqs = usage.get("reqs", 0)
+                inp = usage.get("inp", 0)
+                cached = usage.get("cached", 0)
+                if reqs > 0:
+                    detail_prefix = "  " if is_last else "│ "
+                    avg_inp = inp // reqs
+                    parts = [f"{reqs} запр."]
+                    parts.append(f"~{_fmt_tokens(avg_inp)}/запрос")
+                    if cached > 0 and inp > 0:
+                        cache_pct = int(cached / inp * 100)
+                        parts.append(f"{cache_pct}% из кеша")
+                    lines.append(f"  {detail_prefix}  {', '.join(parts)}")
+
+            lines.append("")
+
+        lines.append(f"💵 Итого: ${total_all:.2f}")
+        lines.append(f"📊 Лимит: ${COST_DAILY_LIMIT:.0f}/день")
+        if total_all >= COST_DAILY_LIMIT * days:
+            lines.append("🔴 Расходы выше лимита!")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+
+async def get_today_cost() -> float:
+    """Получить стоимость за текущий день (для фонового алерта)."""
+    if not OPENAI_ADMIN_KEY:
+        return 0.0
+    import calendar
+    now = datetime.datetime.utcnow()
+    start = now.replace(hour=0, minute=0, second=0)
+    start_ts = int(calendar.timegm(start.timetuple()))
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.openai.com/v1/organization/costs",
+                params={"start_time": start_ts, "bucket_width": "1d"},
+                headers={"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"},
+            )
+        if resp.status_code != 200:
+            return 0.0
+        total = 0.0
+        for bucket in resp.json().get("data", []):
+            for r in bucket.get("results", []):
+                total += float(r.get("amount", {}).get("value", 0))
+        return total
+    except Exception:
+        return 0.0
 
 
 # ── Команды ───────────────────────────────────────────────────
@@ -201,6 +403,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "f2b":
         result = await sh("sudo fail2ban-client status sshd 2>/dev/null || echo 'fail2ban не установлен'")
+
+    elif action == "costs":
+        await q.edit_message_text("💰 Загружаю расходы...")
+        result = await fetch_openai_costs(days=2)
 
     await q.edit_message_text(result[:4096])
     await ctx.bot.send_message(chat_id=q.message.chat_id, text="Выбери действие:", reply_markup=keyboard())
@@ -342,6 +548,23 @@ async def job_system(ctx: CallbackContext):
         pass
 
 
+async def job_cost_alert(ctx: CallbackContext):
+    """Фоновый алерт при превышении дневного лимита расходов."""
+    cost = await get_today_cost()
+    if cost >= COST_DAILY_LIMIT:
+        if dedup.should_alert("cost:daily"):
+            await ctx.bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"🔴 РАСХОДЫ: ${cost:.2f} сегодня"
+                    f" (лимит: ${COST_DAILY_LIMIT:.0f})\n"
+                    f"Проверь кнопкой 💰 Расходы"
+                ),
+            )
+    else:
+        dedup.reset("cost:daily")
+
+
 # ── Инициализация ─────────────────────────────────────────────
 
 
@@ -357,6 +580,10 @@ async def post_init(app: Application) -> None:
     jq.run_repeating(job_fail2ban, interval=30, first=5)
     jq.run_repeating(job_disk, interval=300, first=20)
     jq.run_repeating(job_system, interval=300, first=25)
+
+    if OPENAI_ADMIN_KEY:
+        jq.run_repeating(job_cost_alert, interval=1800, first=60)
+        logging.info(f"Мониторинг расходов OpenAI: лимит ${COST_DAILY_LIMIT}/день")
 
     async def prune(ctx: CallbackContext):
         dedup.prune()

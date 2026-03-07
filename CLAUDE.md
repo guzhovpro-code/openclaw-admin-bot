@@ -163,6 +163,31 @@ sudo journalctl -u openclaw-admin-bot -n 10 --no-pager
 > - `/start` — панель с кнопками
 > - `/report` — полный отчёт о сервере
 
+### Шаг 6 (опционально): Мониторинг расходов OpenAI
+
+Спроси пользователя:
+
+> Хочешь следить за расходами на OpenAI API прямо в боте? Для этого нужен Admin API ключ.
+
+Если пользователь хочет:
+
+1. Попроси его создать Admin API ключ:
+   > 1. Открой https://platform.openai.com/settings/organization/admin-keys
+   > 2. Нажми «Create new admin key»
+   > 3. Скопируй ключ (начинается с `sk-admin-...`) — **это НЕ обычный API-ключ**
+   > 4. Скинь мне ключ
+
+2. Добавь ключ в `.env`:
+   ```bash
+   echo "OPENAI_ADMIN_KEY=КЛЮЧ_ОТ_ПОЛЬЗОВАТЕЛЯ" >> /home/deploy/admin-bot/.env
+   echo "COST_DAILY_LIMIT=10" >> /home/deploy/admin-bot/.env
+   sudo systemctl restart openclaw-admin-bot
+   ```
+
+3. Скажи пользователю:
+   > Готово! Теперь в панели появилась кнопка 💰 Расходы — она покажет расходы по дням и моделям.
+   > Если дневной расход превысит $10, бот пришлёт алерт.
+
 ---
 
 ## Правила
