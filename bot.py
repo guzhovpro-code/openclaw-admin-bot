@@ -483,10 +483,13 @@ async def fetch_openai_costs(days: int = 2) -> str:
         remaining = max(0, COST_DAILY_LIMIT - today_cost)
         lines.append(f"💳 Остаток на сегодня: ~${remaining:.2f} из ${COST_DAILY_LIMIT:.0f}")
 
-        # Средний расход
+        # Средний расход + прогноз на месяц
         n_days = max(len(day_totals), 1)
         avg_daily = total_all / n_days
         lines.append(f"📈 Средний расход: ~${avg_daily:.2f}/день")
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        monthly_forecast = avg_daily * days_in_month
+        lines.append(f"📅 Прогноз на месяц: ~${monthly_forecast:.0f}")
 
         if today_cost >= COST_DAILY_LIMIT:
             lines.append(f"🔴 Дневной лимит превышен!")
@@ -824,18 +827,24 @@ async def job_cost_alert(ctx: CallbackContext):
     _openai_api_was_ok = api_ok
 
     # ── Ступенчатые пороги расходов ──
+    # Отправляем только ОДИН алерт — самый высокий превышенный порог
     if api_ok:
+        highest_hit = None
         for pct, emoji, label in COST_WARN_THRESHOLDS:
             threshold = COST_DAILY_LIMIT * pct
-            key = f"cost:daily:{int(pct * 100)}"
             if cost >= threshold:
-                if dedup.should_alert(key):
-                    await send_alert(
-                        ctx,
-                        f"{emoji} Расходы: ${cost:.2f} — {label} лимита (${COST_DAILY_LIMIT:.0f}/день)",
-                    )
+                highest_hit = (pct, emoji, label)
             else:
-                dedup.reset(key)
+                dedup.reset(f"cost:daily:{int(pct * 100)}")
+
+        if highest_hit:
+            pct, emoji, label = highest_hit
+            key = f"cost:daily:{int(pct * 100)}"
+            if dedup.should_alert(key):
+                await send_alert(
+                    ctx,
+                    f"{emoji} Расходы: ${cost:.2f} — {label} лимита (${COST_DAILY_LIMIT:.0f}/день)",
+                )
 
 
 # ── Инициализация ─────────────────────────────────────────────
