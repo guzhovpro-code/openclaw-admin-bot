@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenClaw Admin Bot v2.1 — чистый дашборд + улучшенный мониторинг."""
+"""OpenClaw Admin Bot v3.0 — мульти-провайдер + защита от ложных алертов."""
 
 import os
 import asyncio
@@ -43,12 +43,17 @@ FAIL2BAN_LOG = "/var/log/fail2ban.log"
 CONFIG_BACKUP_LOG = "/var/log/openclaw-backup.log"
 MONGO_BACKUP_LOG = "/var/log/mongo_backup.log"
 
-# OpenAI расходы
+# Расходы — ключи провайдеров
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "10.0"))
 COST_CHECK_INTERVAL = int(os.environ.get("COST_CHECK_INTERVAL", "300"))
 ALERT_AUTO_DELETE = int(os.environ.get("ALERT_AUTO_DELETE", "3600"))
+
+# Ретраи — сколько подряд неудач до алерта
+HEALTH_FAIL_THRESHOLD = 3
+COST_FAIL_THRESHOLD = 2
 
 # Ступенчатые пороги расходов (% от лимита)
 COST_WARN_THRESHOLDS = [
@@ -89,7 +94,9 @@ dedup = AlertDedup()
 
 _container_was_up: dict[str, bool] = {}
 _health_was_ok: bool = True
+_health_fail_count: int = 0
 _openai_api_was_ok: bool = True
+_openai_fail_count: int = 0
 _f2b_offset: int = 0
 
 # Очистка чата — отслеживание сообщений
@@ -279,8 +286,7 @@ async def _check_openai_api() -> bool:
 async def build_dashboard() -> str:
     """Собрать красивый дашборд."""
     # Собираем данные параллельно
-    container_status, started_at, today_cost_result, \
-        disk, ram, f2b, backup_cfg, backup_mongo = await asyncio.gather(
+    gather_tasks = [
         sh(f"docker ps --filter name={PRIMARY} --format '{{{{.Status}}}}'"),
         sh(f"docker inspect --format '{{{{.State.StartedAt}}}}' {PRIMARY} 2>/dev/null"),
         get_today_cost(),
@@ -289,9 +295,22 @@ async def build_dashboard() -> str:
         _fmt_f2b(),
         _fmt_backup(CONFIG_BACKUP_LOG, "конфиги"),
         _fmt_backup(MONGO_BACKUP_LOG, "MongoDB"),
-    )
+    ]
+    if OPENROUTER_API_KEY:
+        gather_tasks.append(get_openrouter_usage())
 
-    today_cost, api_ok = today_cost_result
+    results = await asyncio.gather(*gather_tasks)
+
+    container_status = results[0]
+    started_at = results[1]
+    today_cost, api_ok = results[2]
+    disk = results[3]
+    ram = results[4]
+    f2b = results[5]
+    backup_cfg = results[6]
+    backup_mongo = results[7]
+    or_data = results[8] if OPENROUTER_API_KEY else None
+
     is_up = container_status.strip().startswith("Up")
 
     lines = ["📊 ДАШБОРД", "━━━━━━━━━━━━━━━━━"]
@@ -306,13 +325,26 @@ async def build_dashboard() -> str:
 
     lines.append("")
 
-    # API OpenAI
+    # Суммарные расходы
+    total_today = 0.0
+    cost_parts = []
+
     if OPENAI_ADMIN_KEY or OPENAI_API_KEY:
-        api_emoji = "✅ доступен" if api_ok else "❌ недоступен"
-        lines.append(f"🌐 API OpenAI: {api_emoji}")
-        remaining = max(0, COST_DAILY_LIMIT - today_cost)
-        lines.append(f"💰 Расходы: ${today_cost:.2f} из ${COST_DAILY_LIMIT:.0f} (осталось ${remaining:.2f})")
-        lines.append("")
+        api_emoji = "✅" if api_ok else "❌"
+        lines.append(f"🌐 OpenAI API: {api_emoji}")
+        if api_ok:
+            total_today += today_cost
+            cost_parts.append(f"OpenAI ${today_cost:.2f}")
+
+    if or_data and or_data["ok"]:
+        or_daily = or_data["daily"] or 0
+        total_today += or_daily
+        cost_parts.append(f"OpenRouter ${or_daily:.2f}")
+
+    lines.append(f"💰 Расходы сегодня: ${total_today:.2f}")
+    if cost_parts:
+        lines.append(f"   ({' + '.join(cost_parts)})")
+    lines.append("")
 
     # Ресурсы
     lines.append(f"💾 Диск: {disk}")
@@ -524,6 +556,85 @@ async def get_today_cost() -> tuple[float, bool]:
         return 0.0, False
 
 
+# ── OpenRouter Usage ──────────────────────────────────────────
+
+
+async def get_openrouter_usage() -> dict[str, float | None]:
+    """Получить расходы OpenRouter. Возвращает dict с daily/monthly/total."""
+    if not OPENROUTER_API_KEY:
+        return {"daily": None, "monthly": None, "total": None, "ok": False}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://openrouter.ai/api/v1/auth/key",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            )
+        if resp.status_code != 200:
+            return {"daily": None, "monthly": None, "total": None, "ok": False}
+        data = resp.json().get("data", {})
+        return {
+            "daily": data.get("usage_daily", 0),
+            "monthly": data.get("usage_monthly", 0),
+            "total": data.get("usage", 0),
+            "ok": True,
+        }
+    except Exception:
+        return {"daily": None, "monthly": None, "total": None, "ok": False}
+
+
+async def fetch_all_costs(days: int = 2) -> str:
+    """Сводка расходов по всем провайдерам."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    lines = ["💰 РАСХОДЫ НА ИИ", ""]
+
+    grand_today = 0.0
+    grand_monthly = 0.0
+
+    # ── OpenAI ──
+    if OPENAI_ADMIN_KEY:
+        openai_text = await fetch_openai_costs(days=days)
+        # Извлекаем данные из get_today_cost для суммарного подсчёта
+        today_cost, api_ok = await get_today_cost()
+        if api_ok:
+            grand_today += today_cost
+        lines.append("━━ OpenAI ━━")
+        # Показываем только ключевые строки из openai_text
+        for line in openai_text.split("\n"):
+            if line and not line.startswith("💰 РАСХОДЫ"):
+                lines.append(line)
+        lines.append("")
+
+    # ── OpenRouter ──
+    if OPENROUTER_API_KEY:
+        or_data = await get_openrouter_usage()
+        lines.append("━━ OpenRouter ━━")
+        if or_data["ok"]:
+            daily = or_data["daily"] or 0
+            monthly = or_data["monthly"] or 0
+            grand_today += daily
+            grand_monthly += monthly
+            lines.append(f"📅 Сегодня: ${daily:.2f}")
+            lines.append(f"📅 За месяц: ${monthly:.2f}")
+        else:
+            lines.append("⚠️ API недоступен")
+        lines.append("")
+
+    # ── Недоступные провайдеры ──
+    unavailable = []
+    unavailable.append("Zen (Z.AI)")
+    unavailable.append("Google Gemini")
+    unavailable.append("Deepgram")
+    unavailable.append("Perplexity")
+    lines.append(f"ℹ️ Без API отслеживания: {', '.join(unavailable)}")
+    lines.append("")
+
+    # ── Итог ──
+    lines.append("━━ ИТОГО ━━")
+    lines.append(f"💵 Сегодня: ~${grand_today:.2f}")
+
+    return "\n".join(lines)
+
+
 # ── Команды ───────────────────────────────────────────────────
 
 
@@ -617,7 +728,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "costs":
         await q.edit_message_text("💰 Загружаю расходы...")
-        result = await fetch_openai_costs(days=2)
+        result = await fetch_all_costs(days=2)
 
     else:
         result = "Неизвестная команда"
@@ -670,7 +781,7 @@ async def job_containers(ctx: CallbackContext):
 
 
 async def job_health(ctx: CallbackContext):
-    global _health_was_ok
+    global _health_was_ok, _health_fail_count
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(HEALTH_URL, timeout=10)
@@ -678,21 +789,26 @@ async def job_health(ctx: CallbackContext):
     except Exception:
         ok = False
 
-    if not ok and _health_was_ok:
-        if dedup.should_alert("health:openclaw"):
+    if not ok:
+        _health_fail_count += 1
+        if _health_was_ok and _health_fail_count >= HEALTH_FAIL_THRESHOLD:
+            if dedup.should_alert("health:openclaw"):
+                await send_alert(
+                    ctx,
+                    f"🔴 OpenClaw healthcheck НЕ ОТВЕЧАЕТ ({_health_fail_count} проверок подряд)",
+                    delete_after=7200,
+                )
+            _health_was_ok = False
+    else:
+        _health_fail_count = 0
+        if not _health_was_ok:
+            dedup.reset("health:openclaw")
             await send_alert(
                 ctx,
-                f"🔴 OpenClaw healthcheck НЕ ОТВЕЧАЕТ",
-                delete_after=7200,
+                "🟢 OpenClaw healthcheck восстановлен",
+                delete_after=1800,
             )
-    elif ok and not _health_was_ok:
-        dedup.reset("health:openclaw")
-        await send_alert(
-            ctx,
-            "🟢 OpenClaw healthcheck восстановлен",
-            delete_after=1800,
-        )
-    _health_was_ok = ok
+            _health_was_ok = True
 
 
 async def job_fail2ban(ctx: CallbackContext):
@@ -799,35 +915,38 @@ async def job_backup_mongo(ctx: CallbackContext):
 
 
 async def job_cost_alert(ctx: CallbackContext):
-    """Проверка расходов OpenAI — ступенчатые пороги + детекция API."""
-    global _openai_api_was_ok
+    """Проверка расходов — ступенчатые пороги + детекция API (с ретраями)."""
+    global _openai_api_was_ok, _openai_fail_count
     if not OPENAI_ADMIN_KEY:
         return
 
     cost, api_ok = await get_today_cost()
 
-    # ── Детекция состояния API ──
-    if not api_ok and _openai_api_was_ok:
-        if dedup.should_alert("openai:api_down"):
+    # ── Детекция состояния API (с ретраями) ──
+    if not api_ok:
+        _openai_fail_count += 1
+        if _openai_api_was_ok and _openai_fail_count >= COST_FAIL_THRESHOLD:
+            if dedup.should_alert("openai:api_down"):
+                await send_alert(
+                    ctx,
+                    "🔴 OpenAI API недоступен — проверьте квоту или баланс",
+                    delete_after=7200,
+                )
+            _openai_api_was_ok = False
+    else:
+        _openai_fail_count = 0
+        if not _openai_api_was_ok:
+            dedup.reset("openai:api_down")
+            for pct, _, _ in COST_WARN_THRESHOLDS:
+                dedup.reset(f"cost:daily:{int(pct * 100)}")
             await send_alert(
                 ctx,
-                "🔴 OpenAI API недоступен — квота исчерпана или ошибка",
-                delete_after=7200,
+                "🟢 OpenAI API восстановлен",
+                delete_after=3600,
             )
-    elif api_ok and not _openai_api_was_ok:
-        dedup.reset("openai:api_down")
-        # Сбрасываем все пороги расходов при восстановлении
-        for pct, _, _ in COST_WARN_THRESHOLDS:
-            dedup.reset(f"cost:daily:{int(pct * 100)}")
-        await send_alert(
-            ctx,
-            "🟢 OpenAI API восстановлен — баланс пополнен",
-            delete_after=3600,
-        )
-    _openai_api_was_ok = api_ok
+            _openai_api_was_ok = True
 
     # ── Ступенчатые пороги расходов ──
-    # Отправляем только ОДИН алерт — самый высокий превышенный порог
     if api_ok:
         highest_hit = None
         for pct, emoji, label in COST_WARN_THRESHOLDS:
@@ -843,7 +962,7 @@ async def job_cost_alert(ctx: CallbackContext):
             if dedup.should_alert(key):
                 await send_alert(
                     ctx,
-                    f"{emoji} Расходы: ${cost:.2f} — {label} лимита (${COST_DAILY_LIMIT:.0f}/день)",
+                    f"{emoji} OpenAI: ${cost:.2f} — {label} лимита (${COST_DAILY_LIMIT:.0f}/день)",
                 )
 
 
@@ -884,7 +1003,7 @@ async def post_init(app: Application) -> None:
         dedup.prune()
     jq.run_repeating(prune, interval=3600, first=3600)
 
-    logging.info("Бот v2.1 запущен, мониторинг активен")
+    logging.info("Бот v3.0 запущен, мониторинг активен")
 
 
 # ── Точка входа ───────────────────────────────────────────────
