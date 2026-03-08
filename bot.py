@@ -241,25 +241,47 @@ async def _fmt_f2b() -> str:
         return "?"
 
 
-async def _fmt_backup(log_path: str, label: str) -> str:
-    """'✅ сегодня 07:10' или '❌ нет записи за сегодня'."""
+async def _fmt_backup_config() -> str:
+    """Статус бэкапа конфигов — по логу с датами."""
     today = datetime.date.today().isoformat()
-    raw = await sh(f"tail -5 {log_path} 2>/dev/null")
-    if "ОШИБКА" in raw or not raw.strip() or raw == "(нет вывода)":
-        return f"⚠️ лог недоступен"
+    raw = await sh(f"tail -5 {CONFIG_BACKUP_LOG} 2>/dev/null")
+    if not raw.strip() or raw == "(нет вывода)":
+        return "⚠️ лог недоступен"
     if "ERROR" in raw.upper() or "FAILED" in raw.upper():
-        return f"❌ ошибка в логе"
+        return "❌ ошибка"
     if today in raw:
-        # Попробуем найти время
         for line in reversed(raw.split("\n")):
             if today in line:
                 try:
-                    time_part = line.split("T")[1][:5] if "T" in line else line.split()[1][:5]
+                    # [config-backup 2026-03-08 04:00] → 04:00
+                    time_part = line.split(today)[1].strip().split("]")[0].strip()
                     return f"✅ сегодня {time_part}"
                 except Exception:
-                    return f"✅ сегодня"
-        return f"✅ сегодня"
-    return f"❌ нет записи за сегодня"
+                    return "✅ сегодня"
+        return "✅ сегодня"
+    return "❌ нет записи за сегодня"
+
+
+async def _fmt_backup_mongo() -> str:
+    """Статус бэкапа MongoDB — по rclone логу (без дат, проверяем свежесть файла)."""
+    # Проверяем когда лог последний раз менялся
+    age = await sh(f"stat -c %Y {MONGO_BACKUP_LOG} 2>/dev/null")
+    if not age.strip().isdigit():
+        return "⚠️ лог недоступен"
+    last_mod = int(age.strip())
+    now = int(datetime.datetime.now().timestamp())
+    hours_ago = (now - last_mod) / 3600
+    if hours_ago > 48:
+        return "❌ давно не обновлялся"
+    # Проверяем содержимое на ошибки
+    raw = await sh(f"tail -5 {MONGO_BACKUP_LOG} 2>/dev/null")
+    if "ERROR" in raw.upper() or "FAILED" in raw.upper():
+        return "❌ ошибка"
+    if "100%" in raw or "Transferred" in raw:
+        if hours_ago < 24:
+            return "✅ ок"
+        return f"✅ {int(hours_ago)}ч назад"
+    return "✅ ок"
 
 
 async def _check_openai_api() -> bool:
@@ -293,8 +315,8 @@ async def build_dashboard() -> str:
         _fmt_disk(),
         _fmt_ram(),
         _fmt_f2b(),
-        _fmt_backup(CONFIG_BACKUP_LOG, "конфиги"),
-        _fmt_backup(MONGO_BACKUP_LOG, "MongoDB"),
+        _fmt_backup_config(),
+        _fmt_backup_mongo(),
     ]
     if OPENROUTER_API_KEY:
         gather_tasks.append(get_openrouter_usage())
@@ -620,12 +642,7 @@ async def fetch_all_costs(days: int = 2) -> str:
         lines.append("")
 
     # ── Недоступные провайдеры ──
-    unavailable = []
-    unavailable.append("Zen (Z.AI)")
-    unavailable.append("Google Gemini")
-    unavailable.append("Deepgram")
-    unavailable.append("Perplexity")
-    lines.append(f"ℹ️ Без API отслеживания: {', '.join(unavailable)}")
+    lines.append(f"ℹ️ Без API: Google, Deepgram, Perplexity")
     lines.append("")
 
     # ── Итог ──
@@ -662,8 +679,8 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sh("uptime | awk -F'load average:' '{print $2}'"),
         sh(f"curl -s -o /dev/null -w '%{{http_code}}' {HEALTH_URL}"),
         sh("sudo fail2ban-client status sshd 2>/dev/null | grep -E 'Currently|Total'"),
-        sh(f"tail -2 {CONFIG_BACKUP_LOG} 2>/dev/null"),
-        sh(f"tail -3 {MONGO_BACKUP_LOG} 2>/dev/null"),
+        _fmt_backup_config(),
+        _fmt_backup_mongo(),
     )
 
     text = (
@@ -674,8 +691,8 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⚡ Нагрузка:{results[3]}\n\n"
         f"🏥 OpenClaw Health: HTTP {results[4]}\n\n"
         f"🛡 Fail2ban:\n{results[5]}\n\n"
-        f"📦 Бэкап конфигов:\n{results[6]}\n\n"
-        f"📦 Бэкап MongoDB:\n{results[7]}"
+        f"📦 Бэкап конфигов: {results[6]}\n"
+        f"📦 Бэкап MongoDB: {results[7]}"
     )
     await update.message.reply_text(text[:4096])
 
